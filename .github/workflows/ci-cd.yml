@@ -1,0 +1,431 @@
+name: ClinicWave CI/CD Pipeline
+
+on:
+  push:
+    branches: [main, develop]
+    paths-ignore:
+      - '**.md'
+      - 'docs/**'
+      - '.github/ISSUE_TEMPLATE/**'
+  pull_request:
+    branches: [main, develop]
+    paths-ignore:
+      - '**.md'
+      - 'docs/**'
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Deployment environment'
+        required: true
+        default: 'staging'
+        type: choice
+        options:
+          - staging
+          - production
+
+env:
+  NODE_VERSION: '18'
+  PNPM_VERSION: '8.x'
+  DOCKER_REGISTRY: ghcr.io
+  DOCKER_IMAGE_PREFIX: ${{ github.repository_owner }}/clinicwave
+
+jobs:
+  setup:
+    name: Setup and Install Dependencies
+    runs-on: ubuntu-latest
+    outputs:
+      cache-hit: ${{ steps.cache.outputs.cache-hit }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v3
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v3
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Setup PNPM
+        uses: pnpm/action-setup@v2
+        with:
+          version: ${{ env.PNPM_VERSION }}
+
+      - name: Get pnpm store directory
+        id: pnpm-cache
+        shell: bash
+        run: |
+          echo "STORE_PATH=$(pnpm store path)" >> $GITHUB_OUTPUT
+
+      - name: Setup pnpm cache
+        uses: actions/cache@v3
+        id: cache
+        with:
+          path: |
+            ${{ steps.pnpm-cache.outputs.STORE_PATH }}
+            node_modules
+            */*/node_modules
+          key: ${{ runner.os }}-pnpm-${{ hashFiles('**/pnpm-lock.yaml') }}
+          restore-keys: |
+            ${{ runner.os }}-pnpm-
+
+      - name: Install dependencies
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: pnpm install --frozen-lockfile
+
+  lint:
+    name: Lint Code
+    needs: setup
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v3
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v3
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Setup PNPM
+        uses: pnpm/action-setup@v2
+        with:
+          version: ${{ env.PNPM_VERSION }}
+
+      - name: Restore cache
+        uses: actions/cache@v3
+        with:
+          path: |
+            node_modules
+            */*/node_modules
+          key: ${{ runner.os }}-pnpm-${{ hashFiles('**/pnpm-lock.yaml') }}
+
+      - name: Lint shared package
+        run: pnpm --filter @clinicwave/shared lint
+
+      - name: Lint API package
+        run: pnpm --filter @clinicwave/api lint
+
+      - name: Lint Web package
+        run: pnpm --filter @clinicwave/web lint
+
+  test:
+    name: Run Tests
+    needs: setup
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:15-alpine
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: clinicwave_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v3
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v3
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Setup PNPM
+        uses: pnpm/action-setup@v2
+        with:
+          version: ${{ env.PNPM_VERSION }}
+
+      - name: Restore cache
+        uses: actions/cache@v3
+        with:
+          path: |
+            node_modules
+            */*/node_modules
+          key: ${{ runner.os }}-pnpm-${{ hashFiles('**/pnpm-lock.yaml') }}
+
+      - name: Generate Prisma client
+        run: cd packages/api && npx prisma generate
+
+      - name: Run shared package tests
+        run: pnpm --filter @clinicwave/shared test
+
+      - name: Run API tests
+        run: pnpm --filter @clinicwave/api test
+        env:
+          DATABASE_URL: postgresql://postgres:postgres@localhost:5432/clinicwave_test?schema=public
+          REDIS_URL: redis://localhost:6379
+          JWT_SECRET: test_jwt_secret
+          ENCRYPTION_KEY: 12345678901234567890123456789012
+          ENCRYPTION_IV: 1234567890123456
+
+      - name: Run Web tests
+        run: pnpm --filter @clinicwave/web test
+
+      - name: Upload test coverage
+        uses: codecov/codecov-action@v3
+        with:
+          directory: ./coverage
+          flags: unittests
+          fail_ci_if_error: false
+
+  security-scan:
+    name: Security Scanning
+    needs: setup
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v3
+
+      - name: Run npm audit
+        run: npm audit --production
+
+      - name: Run Snyk scan
+        uses: snyk/actions/node@master
+        continue-on-error: true
+        env:
+          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+        with:
+          args: --severity-threshold=high
+
+  build:
+    name: Build Packages
+    needs: [lint, test]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v3
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v3
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Setup PNPM
+        uses: pnpm/action-setup@v2
+        with:
+          version: ${{ env.PNPM_VERSION }}
+
+      - name: Restore cache
+        uses: actions/cache@v3
+        with:
+          path: |
+            node_modules
+            */*/node_modules
+          key: ${{ runner.os }}-pnpm-${{ hashFiles('**/pnpm-lock.yaml') }}
+
+      - name: Build shared package
+        run: pnpm --filter @clinicwave/shared build
+
+      - name: Build API package
+        run: pnpm --filter @clinicwave/api build
+
+      - name: Build Web package
+        run: pnpm --filter @clinicwave/web build
+        env:
+          VITE_API_URL: https://api.clinicwave.com
+          VITE_WS_URL: wss://api.clinicwave.com
+
+      - name: Upload API build artifact
+        uses: actions/upload-artifact@v3
+        with:
+          name: api-build
+          path: packages/api/dist
+          retention-days: 1
+
+      - name: Upload Web build artifact
+        uses: actions/upload-artifact@v3
+        with:
+          name: web-build
+          path: packages/web/dist
+          retention-days: 1
+
+  docker-build:
+    name: Build Docker Images
+    needs: [build, security-scan]
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v2
+
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@v2
+        with:
+          registry: ${{ env.DOCKER_REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata for API Docker image
+        id: meta-api
+        uses: docker/metadata-action@v4
+        with:
+          images: ${{ env.DOCKER_REGISTRY }}/${{ env.DOCKER_IMAGE_PREFIX }}/api
+          tags: |
+            type=ref,event=branch
+            type=ref,event=pr
+            type=semver,pattern={{version}}
+            type=sha,format=short
+
+      - name: Extract metadata for Web Docker image
+        id: meta-web
+        uses: docker/metadata-action@v4
+        with:
+          images: ${{ env.DOCKER_REGISTRY }}/${{ env.DOCKER_IMAGE_PREFIX }}/web
+          tags: |
+            type=ref,event=branch
+            type=ref,event=pr
+            type=semver,pattern={{version}}
+            type=sha,format=short
+
+      - name: Build and push API Docker image
+        uses: docker/build-push-action@v4
+        with:
+          context: .
+          file: packages/api/Dockerfile
+          push: true
+          tags: ${{ steps.meta-api.outputs.tags }}
+          labels: ${{ steps.meta-api.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Build and push Web Docker image
+        uses: docker/build-push-action@v4
+        with:
+          context: .
+          file: packages/web/Dockerfile
+          push: true
+          tags: ${{ steps.meta-web.outputs.tags }}
+          labels: ${{ steps.meta-web.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  deploy-staging:
+    name: Deploy to Staging
+    needs: docker-build
+    runs-on: ubuntu-latest
+    if: (github.event_name == 'push' && github.ref == 'refs/heads/develop') || (github.event_name == 'workflow_dispatch' && github.event.inputs.environment == 'staging')
+    environment:
+      name: staging
+      url: https://staging.clinicwave.com
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v3
+
+      - name: Setup SSH
+        uses: webfactory/ssh-agent@v0.7.0
+        with:
+          ssh-private-key: ${{ secrets.STAGING_SSH_PRIVATE_KEY }}
+
+      - name: Setup kubectl
+        uses: azure/setup-kubectl@v3
+        with:
+          version: 'latest'
+
+      - name: Configure kubectl
+        run: |
+          mkdir -p $HOME/.kube
+          echo "${{ secrets.STAGING_KUBECONFIG }}" > $HOME/.kube/config
+          chmod 600 $HOME/.kube/config
+
+      - name: Deploy to Kubernetes
+        run: |
+          kubectl config use-context staging
+          kubectl apply -f k8s/staging/
+          kubectl set image deployment/clinicwave-api api=${{ env.DOCKER_REGISTRY }}/${{ env.DOCKER_IMAGE_PREFIX }}/api:sha-${{ github.sha }}
+          kubectl set image deployment/clinicwave-web web=${{ env.DOCKER_REGISTRY }}/${{ env.DOCKER_IMAGE_PREFIX }}/web:sha-${{ github.sha }}
+          kubectl rollout status deployment/clinicwave-api --timeout=300s
+          kubectl rollout status deployment/clinicwave-web --timeout=300s
+
+      - name: Run database migrations
+        run: |
+          kubectl exec -it deployment/clinicwave-api -- npx prisma migrate deploy
+
+      - name: Verify deployment
+        run: |
+          kubectl get pods
+          echo "Staging deployment completed successfully!"
+
+  deploy-production:
+    name: Deploy to Production
+    needs: docker-build
+    runs-on: ubuntu-latest
+    if: (github.event_name == 'push' && github.ref == 'refs/heads/main') || (github.event_name == 'workflow_dispatch' && github.event.inputs.environment == 'production')
+    environment:
+      name: production
+      url: https://clinicwave.com
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v3
+
+      - name: Setup SSH
+        uses: webfactory/ssh-agent@v0.7.0
+        with:
+          ssh-private-key: ${{ secrets.PRODUCTION_SSH_PRIVATE_KEY }}
+
+      - name: Setup kubectl
+        uses: azure/setup-kubectl@v3
+        with:
+          version: 'latest'
+
+      - name: Configure kubectl
+        run: |
+          mkdir -p $HOME/.kube
+          echo "${{ secrets.PRODUCTION_KUBECONFIG }}" > $HOME/.kube/config
+          chmod 600 $HOME/.kube/config
+
+      - name: Deploy to Kubernetes
+        run: |
+          kubectl config use-context production
+          kubectl apply -f k8s/production/
+          kubectl set image deployment/clinicwave-api api=${{ env.DOCKER_REGISTRY }}/${{ env.DOCKER_IMAGE_PREFIX }}/api:sha-${{ github.sha }}
+          kubectl set image deployment/clinicwave-web web=${{ env.DOCKER_REGISTRY }}/${{ env.DOCKER_IMAGE_PREFIX }}/web:sha-${{ github.sha }}
+          kubectl rollout status deployment/clinicwave-api --timeout=300s
+          kubectl rollout status deployment/clinicwave-web --timeout=300s
+
+      - name: Run database migrations
+        run: |
+          kubectl exec -it deployment/clinicwave-api -- npx prisma migrate deploy
+
+      - name: Verify deployment
+        run: |
+          kubectl get pods
+          echo "Production deployment completed successfully!"
+
+  notify:
+    name: Send Notifications
+    needs: [deploy-staging, deploy-production]
+    runs-on: ubuntu-latest
+    if: always()
+    steps:
+      - name: Notify on success
+        if: ${{ success() }}
+        uses: rtCamp/action-slack-notify@v2
+        env:
+          SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK }}
+          SLACK_COLOR: good
+          SLACK_TITLE: "✅ ClinicWave CI/CD Pipeline Succeeded"
+          SLACK_MESSAGE: "Successfully deployed to ${{ github.event.inputs.environment || (github.ref == 'refs/heads/main' && 'production' || 'staging') }}"
+
+      - name: Notify on failure
+        if: ${{ failure() }}
+        uses: rtCamp/action-slack-notify@v2
+        env:
+          SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK }}
+          SLACK_COLOR: danger
+          SLACK_TITLE: "❌ ClinicWave CI/CD Pipeline Failed"
+          SLACK_MESSAGE: "Deployment to ${{ github.event.inputs.environment || (github.ref == 'refs/heads/main' && 'production' || 'staging') }} failed. Please check the logs."

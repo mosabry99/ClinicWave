@@ -1,0 +1,249 @@
+version: '3.8'
+
+services:
+  # API Backend Service (NestJS)
+  api:
+    build:
+      context: .
+      dockerfile: packages/api/Dockerfile
+    container_name: clinicwave-api
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      - NODE_ENV=production
+      - DATABASE_URL=postgresql://postgres:${POSTGRES_PASSWORD}@postgres:5432/clinicwave?schema=public
+      - REDIS_URL=redis://redis:6379
+      - JWT_SECRET=${JWT_SECRET}
+      - JWT_EXPIRATION=86400
+      - ENCRYPTION_KEY=${ENCRYPTION_KEY}
+      - ENCRYPTION_IV=${ENCRYPTION_IV}
+      - S3_ENDPOINT=http://minio:9000
+      - S3_ACCESS_KEY=${MINIO_ROOT_USER}
+      - S3_SECRET_KEY=${MINIO_ROOT_PASSWORD}
+      - S3_BUCKET=clinicwave
+      - SMTP_HOST=${SMTP_HOST:-mailhog}
+      - SMTP_PORT=${SMTP_PORT:-1025}
+      - SMTP_USER=${SMTP_USER:-}
+      - SMTP_PASS=${SMTP_PASS:-}
+      - SMTP_FROM=${SMTP_FROM:-no-reply@clinicwave.com}
+      - SMS_PROVIDER=${SMS_PROVIDER:-}
+      - SMS_API_KEY=${SMS_API_KEY:-}
+      - POLAR_API_KEY=${POLAR_API_KEY:-}
+      - FAWRY_PAY_API_KEY=${FAWRY_PAY_API_KEY:-}
+      - STRIPE_API_KEY=${STRIPE_API_KEY:-}
+      - PAYPAL_CLIENT_ID=${PAYPAL_CLIENT_ID:-}
+      - PAYPAL_CLIENT_SECRET=${PAYPAL_CLIENT_SECRET:-}
+      - CORS_ORIGIN=${CORS_ORIGIN:-http://localhost:3000}
+      - TZ=UTC
+    ports:
+      - "4000:4000"
+    volumes:
+      - ./packages/api/uploads:/app/uploads
+      - ./packages/api/logs:/app/logs
+    networks:
+      - clinicwave-network
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:4000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+
+  # Web Frontend Service (React/Vite PWA)
+  web:
+    build:
+      context: .
+      dockerfile: packages/web/Dockerfile
+    container_name: clinicwave-web
+    restart: unless-stopped
+    depends_on:
+      - api
+    ports:
+      - "3000:80"
+    environment:
+      - VITE_API_URL=${API_URL:-http://localhost:4000}
+      - VITE_WS_URL=${WS_URL:-ws://localhost:4000}
+    networks:
+      - clinicwave-network
+
+  # PostgreSQL Database
+  postgres:
+    image: postgres:15-alpine
+    container_name: clinicwave-postgres
+    restart: unless-stopped
+    environment:
+      - POSTGRES_USER=postgres
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
+      - POSTGRES_DB=clinicwave
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./packages/api/prisma/init.sql:/docker-entrypoint-initdb.d/init.sql
+    networks:
+      - clinicwave-network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    command: ["postgres", "-c", "log_statement=all", "-c", "max_connections=100"]
+
+  # Redis for Caching, Session Management, and WebSockets
+  redis:
+    image: redis:7-alpine
+    container_name: clinicwave-redis
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+    networks:
+      - clinicwave-network
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    command: ["redis-server", "--appendonly", "yes", "--requirepass", "${REDIS_PASSWORD:-}"]
+
+  # MinIO Object Storage (S3 compatible)
+  minio:
+    image: minio/minio
+    container_name: clinicwave-minio
+    restart: unless-stopped
+    environment:
+      - MINIO_ROOT_USER=${MINIO_ROOT_USER}
+      - MINIO_ROOT_PASSWORD=${MINIO_ROOT_PASSWORD}
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - minio-data:/data
+    networks:
+      - clinicwave-network
+    command: server /data --console-address ":9001"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 30s
+      timeout: 20s
+      retries: 3
+      start_period: 30s
+
+  # Create MinIO buckets on startup
+  minio-setup:
+    image: minio/mc
+    container_name: clinicwave-minio-setup
+    depends_on:
+      - minio
+    environment:
+      - MINIO_ROOT_USER=${MINIO_ROOT_USER}
+      - MINIO_ROOT_PASSWORD=${MINIO_ROOT_PASSWORD}
+    networks:
+      - clinicwave-network
+    entrypoint: >
+      /bin/sh -c "
+      sleep 10;
+      /usr/bin/mc config host add myminio http://minio:9000 ${MINIO_ROOT_USER} ${MINIO_ROOT_PASSWORD};
+      /usr/bin/mc mb --ignore-existing myminio/clinicwave;
+      /usr/bin/mc policy set public myminio/clinicwave/public;
+      exit 0;
+      "
+
+  # Nginx Reverse Proxy
+  nginx:
+    image: nginx:alpine
+    container_name: clinicwave-nginx
+    restart: unless-stopped
+    depends_on:
+      - api
+      - web
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./nginx/conf.d:/etc/nginx/conf.d:ro
+      - ./nginx/ssl:/etc/nginx/ssl:ro
+      - ./nginx/logs:/var/log/nginx
+    networks:
+      - clinicwave-network
+    healthcheck:
+      test: ["CMD", "nginx", "-t"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+
+  # Mailhog for Email Testing (Development Only)
+  mailhog:
+    image: mailhog/mailhog
+    container_name: clinicwave-mailhog
+    restart: unless-stopped
+    ports:
+      - "1025:1025"
+      - "8025:8025"
+    networks:
+      - clinicwave-network
+    profiles:
+      - dev
+
+  # Adminer for Database Management (Development Only)
+  adminer:
+    image: adminer
+    container_name: clinicwave-adminer
+    restart: unless-stopped
+    depends_on:
+      - postgres
+    ports:
+      - "8080:8080"
+    environment:
+      - ADMINER_DEFAULT_SERVER=postgres
+      - ADMINER_DESIGN=pepa-linha
+    networks:
+      - clinicwave-network
+    profiles:
+      - dev
+
+  # Backup Service
+  backup:
+    image: postgres:15-alpine
+    container_name: clinicwave-backup
+    restart: unless-stopped
+    depends_on:
+      - postgres
+    volumes:
+      - ./backups:/backups
+      - ./scripts/backup.sh:/backup.sh
+    environment:
+      - POSTGRES_HOST=postgres
+      - POSTGRES_DB=clinicwave
+      - POSTGRES_USER=postgres
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
+      - BACKUP_RETENTION_DAYS=7
+      - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID:-}
+      - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY:-}
+      - AWS_S3_BUCKET=${AWS_S3_BUCKET:-}
+    networks:
+      - clinicwave-network
+    entrypoint: ["/bin/sh", "/backup.sh"]
+    profiles:
+      - backup
+
+networks:
+  clinicwave-network:
+    driver: bridge
+
+volumes:
+  postgres-data:
+    driver: local
+  redis-data:
+    driver: local
+  minio-data:
+    driver: local
